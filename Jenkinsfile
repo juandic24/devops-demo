@@ -14,25 +14,19 @@ pipeline {
             }
         }
 
-        stage('Test') {
-            steps {
-                echo "Ejecutando tests dentro de contenedor Python..."
-                sh '''
-                    docker run --rm \
-                        -v $(pwd)/app:/app \
-                        -w /app \
-                        python:3.12-slim \
-                        sh -c "pip install -q -r requirements.txt && python -m pytest test_app.py -v"
-                '''
-            }
-        }
-
         stage('Build Image') {
             steps {
                 echo "Construyendo imagen Docker..."
                 sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ./app"
                 sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
                 sh "docker images ${IMAGE_NAME}"
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo "Ejecutando tests sobre la imagen construida..."
+                sh "docker run --rm ${IMAGE_NAME}:${IMAGE_TAG} python -m pytest test_app.py -v"
             }
         }
 
