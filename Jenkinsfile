@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "devops-demo"
-        IMAGE_TAG  = "1.${BUILD_NUMBER}"
+        IMAGE_NAME   = "devops-demo"
+        IMAGE_TAG    = "1.${BUILD_NUMBER}"
+        ECR_REGISTRY = "localhost:4566"
     }
 
     stages {
@@ -14,19 +15,19 @@ pipeline {
             }
         }
 
-        stage('Build Image') {
+        stage('Test') {
             steps {
-                echo "Construyendo imagen Docker..."
-                sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ./app"
-                sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
-                sh "docker images ${IMAGE_NAME}"
+                echo "Ejecutando tests (falla el build si pytest falla)..."
+                sh "docker build --target test -t ${IMAGE_NAME}:test-${IMAGE_TAG} ./app"
             }
         }
 
-        stage('Test') {
+        stage('Build Image') {
             steps {
-                echo "Ejecutando tests sobre la imagen construida..."
-                sh "docker run --rm ${IMAGE_NAME}:${IMAGE_TAG} python -m pytest test_app.py -v"
+                echo "Construyendo imagen de produccion..."
+                sh "docker build --target production -t ${IMAGE_NAME}:${IMAGE_TAG} ./app"
+                sh "docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest"
+                sh "docker images ${IMAGE_NAME}"
             }
         }
 
@@ -69,6 +70,7 @@ pipeline {
             steps {
                 echo "Creando rol IAM para deploy (LocalStack)..."
                 sh '''
+                    POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
                     docker run --rm \
                         --network devops-demo_default \
                         -e AWS_ACCESS_KEY_ID=test \
@@ -78,8 +80,34 @@ pipeline {
                         --endpoint-url=http://localstack:4566 \
                         iam create-role \
                         --role-name devops-demo-deploy-role \
-                        --assume-role-policy-document '"'"'{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'"'"' \
+                        --assume-role-policy-document "$POLICY" \
                         2>/dev/null || echo "Rol ya existe"
+                '''
+            }
+        }
+
+        stage('ECR - Push imagen') {
+            steps {
+                echo "Autenticando y haciendo push a ECR (LocalStack)..."
+                sh '''
+                    ECR_PASS=$(docker run --rm \
+                        --network devops-demo_default \
+                        -e AWS_ACCESS_KEY_ID=test \
+                        -e AWS_SECRET_ACCESS_KEY=test \
+                        -e AWS_DEFAULT_REGION=us-east-1 \
+                        amazon/aws-cli \
+                        --endpoint-url=http://localstack:4566 \
+                        ecr get-login-password --region us-east-1)
+
+                    echo "$ECR_PASS" | docker login \
+                        --username AWS \
+                        --password-stdin localhost:4566
+
+                    docker tag ${IMAGE_NAME}:${IMAGE_TAG} localhost:4566/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker tag ${IMAGE_NAME}:latest       localhost:4566/${IMAGE_NAME}:latest
+
+                    docker push localhost:4566/${IMAGE_NAME}:${IMAGE_TAG}
+                    docker push localhost:4566/${IMAGE_NAME}:latest
                 '''
             }
         }
@@ -92,9 +120,10 @@ pipeline {
                     docker rm   devops-demo-app 2>/dev/null || true
                     docker run -d \
                         --name devops-demo-app \
+                        --network devops-demo_default \
                         -p 5000:5000 \
                         -e ENV=production \
-                        devops-demo:latest
+                        ${IMAGE_NAME}:latest
                 '''
                 sh "docker ps --filter name=devops-demo-app"
             }
@@ -103,7 +132,13 @@ pipeline {
         stage('Smoke Test') {
             steps {
                 echo "Verificando que la app responde..."
-                sh "sleep 3 && curl -sf http://host.docker.internal:5000/health"
+                sh '''
+                    docker run --rm \
+                        --network devops-demo_default \
+                        curlimages/curl \
+                        --retry 5 --retry-delay 2 --retry-connrefused \
+                        -sf http://devops-demo-app:5000/health
+                '''
             }
         }
     }
